@@ -1045,6 +1045,7 @@ impl NicCtx {
         cur_proxy_cidrs: &mut BTreeSet<cidr::Ipv4Cidr>,
         added: Vec<cidr::Ipv4Cidr>,
         removed: Vec<cidr::Ipv4Cidr>,
+        #[allow(unused_variables)] tun_ipv4: Option<std::net::Ipv4Addr>,
     ) {
         tracing::debug!(?added, ?removed, "applying proxy_cidrs route changes");
 
@@ -1053,6 +1054,25 @@ impl NicCtx {
             if !cur_proxy_cidrs.contains(&cidr) {
                 continue;
             }
+
+            // macOS: 0.0.0.0/0 was installed as split routes, remove those
+            #[cfg(target_os = "macos")]
+            if cidr.network_length() == 0 && cidr.first_address() == std::net::Ipv4Addr::UNSPECIFIED {
+                tracing::info!("macOS: removing split default routes from TUN");
+                let mac_ifcfg = crate::common::ifcfg::IfConfiger {};
+                for (octet, prefix) in MACOS_SPLIT_DEFAULT_ROUTES {
+                    let _ = mac_ifcfg
+                        .remove_ipv4_route_any(std::net::Ipv4Addr::new(octet, 0, 0, 0), prefix)
+                        .await;
+                }
+                // also clean the old-style /1 split left by earlier builds
+                let _ = mac_ifcfg
+                    .remove_ipv4_route_any(std::net::Ipv4Addr::new(0, 0, 0, 0), 1)
+                    .await;
+                cur_proxy_cidrs.remove(&cidr);
+                continue;
+            }
+
             let _g = net_ns.guard();
             let ret = ifcfg
                 .remove_ipv4_route(ifname, cidr.first_address(), cidr.network_length())
@@ -1073,6 +1093,41 @@ impl NicCtx {
             if cur_proxy_cidrs.contains(&cidr) {
                 continue;
             }
+
+            // macOS: adding 0.0.0.0/0 conflicts with the existing system default
+            // route, so install the clash/mihomo-style split instead. Two
+            // hard-won constraints from live debugging:
+            //  - any route whose destination is 0.0.0.0 (e.g. 0.0.0.0/1) is
+            //    marked RTF_GLOBAL by the kernel and breaks sends from
+            //    IP_BOUND_IF-scoped underlay sockets (EHOSTUNREACH), killing
+            //    STUN and hole punching — hence the split starts at 1.0.0.0/8
+            //    and skips the reserved 0.0.0.0/8;
+            //  - gateway-form routes (via the TUN's own address) are used to
+            //    match the empirically verified working configuration.
+            #[cfg(target_os = "macos")]
+            if cidr.network_length() == 0 && cidr.first_address() == std::net::Ipv4Addr::UNSPECIFIED {
+                if let Some(tun_ip) = tun_ipv4 {
+                    let mac_ifcfg = crate::common::ifcfg::IfConfiger {};
+                    for (octet, prefix) in MACOS_SPLIT_DEFAULT_ROUTES {
+                        let dst = std::net::Ipv4Addr::new(octet, 0, 0, 0);
+                        if let Err(e) =
+                            mac_ifcfg.add_ipv4_route_via_gateway(dst, prefix, tun_ip).await
+                        {
+                            tracing::warn!(?dst, prefix, ?e, "macOS: split default route add failed");
+                        }
+                    }
+                    tracing::info!(?tun_ip, "macOS: installed split default routes for TUN routing");
+                } else {
+                    for (octet, prefix) in MACOS_SPLIT_DEFAULT_ROUTES {
+                        let dst = std::net::Ipv4Addr::new(octet, 0, 0, 0);
+                        let _ = ifcfg.add_ipv4_route(ifname, dst, prefix, None).await;
+                    }
+                    tracing::warn!("macOS: tun has no ipv4, split default routes use interface form");
+                }
+                cur_proxy_cidrs.insert(cidr);
+                continue;
+            }
+
             let _g = net_ns.guard();
             let ret = ifcfg
                 .add_ipv4_route(ifname, cidr.first_address(), cidr.network_length(), None)
@@ -1141,6 +1196,17 @@ impl NicCtx {
         self.tasks.spawn(async move {
             let mut cur_proxy_cidrs = BTreeSet::<cidr::Ipv4Cidr>::new();
 
+            // macOS: host routes protecting underlay endpoints from the broad
+            // full-tunnel TUN routes; reconciled periodically so endpoints of
+            // closed conns get pruned and gateway changes are followed
+            #[cfg(target_os = "macos")]
+            let mut bypass = macos_bypass::BypassRouteManager::default();
+            #[cfg(target_os = "macos")]
+            let mut bypass_reconcile = tokio::time::interval_at(
+                tokio::time::Instant::now() + BYPASS_RECONCILE_INTERVAL,
+                BYPASS_RECONCILE_INTERVAL,
+            );
+
             // Initial sync: get current proxy_cidrs state and apply routes
             let (_, added, removed) = ProxyCidrsMonitor::diff_proxy_cidrs(
                 peer_mgr.as_ref(),
@@ -1148,6 +1214,12 @@ impl NicCtx {
                 &cur_proxy_cidrs,
             )
             .await;
+
+            // macOS: install bypass routes before the TUN routes start capturing traffic
+            #[cfg(target_os = "macos")]
+            sync_macos_bypass_routes(&mut bypass, &cur_proxy_cidrs, &added, &global_ctx, &peer_mgr)
+                .await;
+
             Self::apply_route_changes(
                 &ifcfg,
                 &ifname,
@@ -1155,11 +1227,30 @@ impl NicCtx {
                 &mut cur_proxy_cidrs,
                 added,
                 removed,
+                global_ctx.get_ipv4().map(|ip| ip.address()),
             )
             .await;
 
             loop {
-                let event = match event_receiver.recv().await {
+                #[cfg(target_os = "macos")]
+                let received = tokio::select! {
+                    r = event_receiver.recv() => r,
+                    _ = bypass_reconcile.tick() => {
+                        sync_macos_bypass_routes(
+                            &mut bypass,
+                            &cur_proxy_cidrs,
+                            &[],
+                            &global_ctx,
+                            &peer_mgr,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                #[cfg(not(target_os = "macos"))]
+                let received = event_receiver.recv().await;
+
+                let event = match received {
                     Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::debug!("event bus closed, stopping proxy_cidrs route updater");
@@ -1181,11 +1272,34 @@ impl NicCtx {
                     }
                 };
 
-                // Only handle ProxyCidrsUpdated events
                 let (added, removed) = match event {
                     GlobalCtxEvent::ProxyCidrsUpdated(added, removed) => (added, removed),
+                    // a fresh underlay conn (e.g. a just-punched p2p endpoint)
+                    // must be protected before its traffic loops into the TUN
+                    #[cfg(target_os = "macos")]
+                    GlobalCtxEvent::PeerConnAdded(conn) => {
+                        if cur_proxy_cidrs.iter().any(|c| c.network_length() <= 1)
+                            && let Some(ip) = conn_remote_ipv4(&conn)
+                            && is_bypass_candidate_ipv4(ip, &physical_onlink_v4_subnets(), &global_ctx)
+                            && let Some(route) = crate::arch::macos::get_default_route_v4()
+                        {
+                            bypass.add_one(ip, route.gateway).await;
+                        }
+                        continue;
+                    }
                     _ => continue,
                 };
+
+                // macOS: refresh bypass routes before applying main route changes
+                #[cfg(target_os = "macos")]
+                sync_macos_bypass_routes(
+                    &mut bypass,
+                    &cur_proxy_cidrs,
+                    &added,
+                    &global_ctx,
+                    &peer_mgr,
+                )
+                .await;
 
                 Self::apply_route_changes(
                     &ifcfg,
@@ -1194,9 +1308,14 @@ impl NicCtx {
                     &mut cur_proxy_cidrs,
                     added,
                     removed,
+                    global_ctx.get_ipv4().map(|ip| ip.address()),
                 )
                 .await;
             }
+
+            // remove bypass routes when the updater stops
+            #[cfg(target_os = "macos")]
+            bypass.clear().await;
         });
 
         Ok(())
@@ -1425,11 +1544,304 @@ impl NicCtx {
     }
 }
 
+#[cfg(target_os = "macos")]
+const BYPASS_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The clash/mihomo-style default-route split: (first octet, prefix length).
+/// Covers 1.0.0.0-255.255.255.255; 0.0.0.0/8 is reserved and deliberately
+/// skipped so no route has destination 0.0.0.0 (see apply_route_changes).
+#[cfg(target_os = "macos")]
+const MACOS_SPLIT_DEFAULT_ROUTES: [(u8, u8); 8] = [
+    (1, 8),
+    (2, 7),
+    (4, 6),
+    (8, 5),
+    (16, 4),
+    (32, 3),
+    (64, 2),
+    (128, 1),
+];
+
+#[cfg(target_os = "macos")]
+mod macos_bypass {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::net::Ipv4Addr;
+
+    use crate::common::ifcfg::IfConfiger;
+
+    /// Host routes (/32 via the physical gateway) that let easytier's own
+    /// underlay traffic escape the broad TUN routes installed for full tunnel
+    /// (0.0.0.0/1 + 128.0.0.0/1). Without them, packets to peer endpoints
+    /// would be captured by the TUN and loop back into easytier.
+    #[derive(Default)]
+    pub(super) struct BypassRouteManager {
+        installed: BTreeMap<Ipv4Addr, Ipv4Addr>, // dst ip -> gateway
+    }
+
+    impl BypassRouteManager {
+        pub(super) async fn sync(&mut self, desired: &BTreeSet<Ipv4Addr>, gateway: Ipv4Addr) {
+            let ifcfg = IfConfiger {};
+            let stale: Vec<(Ipv4Addr, Ipv4Addr)> = self
+                .installed
+                .iter()
+                .filter(|(ip, gw)| !desired.contains(ip) || **gw != gateway)
+                .map(|(ip, gw)| (*ip, *gw))
+                .collect();
+            for (ip, gw) in stale {
+                if let Err(e) = ifcfg.remove_ipv4_route_any(ip, 32).await {
+                    tracing::warn!(?ip, ?gw, ?e, "failed to remove bypass route");
+                }
+                self.installed.remove(&ip);
+            }
+            for ip in desired {
+                self.add_one(*ip, gateway).await;
+            }
+        }
+
+        pub(super) async fn add_one(&mut self, ip: Ipv4Addr, gateway: Ipv4Addr) {
+            let ifcfg = IfConfiger {};
+            if let Some(old_gw) = self.installed.get(&ip).copied() {
+                if old_gw == gateway {
+                    return;
+                }
+                let _ = ifcfg.remove_ipv4_route_any(ip, 32).await;
+            }
+            if let Err(e) = ifcfg.add_ipv4_route_via_gateway(ip, 32, gateway).await {
+                // the usual failure is EEXIST from a route left over by a
+                // previous run, which still does its job — track it so it
+                // gets cleaned up with the rest
+                tracing::warn!(?ip, ?gateway, ?e, "failed to add bypass route");
+            } else {
+                tracing::info!(?ip, ?gateway, "added underlay bypass route");
+            }
+            self.installed.insert(ip, gateway);
+        }
+
+        pub(super) async fn clear(&mut self) {
+            let ifcfg = IfConfiger {};
+            for (ip, gw) in std::mem::take(&mut self.installed) {
+                if let Err(e) = ifcfg.remove_ipv4_route_any(ip, 32).await {
+                    tracing::warn!(?ip, ?gw, ?e, "failed to remove bypass route");
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a URI to IPv4 addresses (supports IP literals and hostname DNS resolution)
+#[cfg(target_os = "macos")]
+async fn resolve_uri_to_ipv4s(uri: &url::Url) -> Vec<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+    let mut ips = Vec::new();
+    if let Some(host) = uri.host_str() {
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            ips.push(ip);
+            return ips;
+        }
+        if let Ok(addrs) = tokio::net::lookup_host(format!("{}:0", host)).await {
+            for addr in addrs {
+                if let std::net::SocketAddr::V4(v4) = addr {
+                    ips.push(*v4.ip());
+                }
+            }
+        }
+    }
+    ips
+}
+
+/// Extract the underlay remote IPv4 of a peer connection (the on-wire
+/// endpoint, i.e. the hole-punched address for punched conns).
+#[cfg(target_os = "macos")]
+fn conn_remote_ipv4(
+    conn: &crate::proto::api::instance::PeerConnInfo,
+) -> Option<std::net::Ipv4Addr> {
+    let url = conn.tunnel.as_ref()?.effective_remote_addr()?;
+    let parsed = url::Url::parse(&url.url).ok()?;
+    // note: for non-special schemes like udp:// the url crate reports the
+    // host as an opaque domain even when it is an IP literal, so parse the
+    // host string instead of matching url::Host::Ipv4
+    parsed.host_str()?.parse().ok()
+}
+
+/// IPv4 subnets directly connected on physical (non-TUN) interfaces. IPs
+/// inside them are reachable via connected routes that already beat the /1
+/// TUN routes, so they need no bypass.
+#[cfg(target_os = "macos")]
+fn physical_onlink_v4_subnets() -> Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    use network_interface::NetworkInterfaceConfig;
+    let mut subnets = vec![];
+    let Ok(ifaces) = network_interface::NetworkInterface::show() else {
+        return subnets;
+    };
+    for iface in ifaces {
+        if iface.name.starts_with("utun") || iface.name.starts_with("lo") {
+            continue;
+        }
+        for addr in iface.addr {
+            if let network_interface::Addr::V4(v4) = addr
+                && let Some(netmask) = v4.netmask
+            {
+                subnets.push((v4.ip, netmask));
+            }
+        }
+    }
+    subnets
+}
+
+#[cfg(target_os = "macos")]
+fn is_in_any_v4_subnet(
+    ip: std::net::Ipv4Addr,
+    subnets: &[(std::net::Ipv4Addr, std::net::Ipv4Addr)],
+) -> bool {
+    subnets
+        .iter()
+        .any(|(addr, mask)| u32::from(ip) & u32::from(*mask) == u32::from(*addr) & u32::from(*mask))
+}
+
+#[cfg(target_os = "macos")]
+fn is_bypass_candidate_ipv4(
+    ip: std::net::Ipv4Addr,
+    onlink_subnets: &[(std::net::Ipv4Addr, std::net::Ipv4Addr)],
+    global_ctx: &crate::common::global_ctx::ArcGlobalCtx,
+) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !is_in_any_v4_subnet(ip, onlink_subnets)
+        && global_ctx
+            .get_ipv4()
+            .is_none_or(|net| !net.network().contains(&ip))
+}
+
+/// All remote IPv4 endpoints easytier's underlay may talk to: configured
+/// peers, STUN servers, and live peer connections (including hole-punched
+/// endpoints that appear in no config).
+#[cfg(target_os = "macos")]
+async fn collect_underlay_bypass_ips(
+    global_ctx: &crate::common::global_ctx::ArcGlobalCtx,
+    peer_mgr: &std::sync::Arc<crate::peers::peer_manager::PeerManager>,
+) -> std::collections::BTreeSet<std::net::Ipv4Addr> {
+    let mut ips = std::collections::BTreeSet::new();
+
+    for peer in global_ctx.config.get_peers() {
+        let resolved = resolve_uri_to_ipv4s(&peer.uri).await;
+        if resolved.is_empty() {
+            tracing::warn!(uri = %peer.uri, "failed to resolve peer URI for bypass route");
+        }
+        ips.extend(resolved);
+    }
+
+    let peer_map = peer_mgr.get_peer_map();
+    for peer_id in peer_map.list_peers_with_conn().await {
+        for conn in peer_map.list_peer_conns(peer_id).await.unwrap_or_default() {
+            ips.extend(conn_remote_ipv4(&conn));
+        }
+    }
+
+    let onlink_subnets = physical_onlink_v4_subnets();
+    ips.retain(|ip| is_bypass_candidate_ipv4(*ip, &onlink_subnets, global_ctx));
+    ips
+}
+
+/// Reconcile bypass host routes with the current desired endpoint set. Only
+/// active while broad TUN routes (prefix <= 1) are installed or about to be.
+#[cfg(target_os = "macos")]
+async fn sync_macos_bypass_routes(
+    bypass: &mut macos_bypass::BypassRouteManager,
+    cur_proxy_cidrs: &BTreeSet<cidr::Ipv4Cidr>,
+    pending_added: &[cidr::Ipv4Cidr],
+    global_ctx: &crate::common::global_ctx::ArcGlobalCtx,
+    peer_mgr: &std::sync::Arc<crate::peers::peer_manager::PeerManager>,
+) {
+    let full_tunnel = cur_proxy_cidrs
+        .iter()
+        .chain(pending_added.iter())
+        .any(|c| c.network_length() <= 1);
+    if !full_tunnel {
+        bypass.clear().await;
+        return;
+    }
+
+    let Some(route) = crate::arch::macos::get_default_route_v4() else {
+        // transient loss of the default route (e.g. wifi roaming) should not
+        // tear down routes that may come back into effect
+        tracing::warn!("no physical default route, skip bypass route sync");
+        return;
+    };
+    let ips = collect_underlay_bypass_ips(global_ctx, peer_mgr).await;
+    tracing::debug!(?ips, gateway = ?route.gateway, "syncing underlay bypass routes");
+    bypass.sync(&ips, route.gateway).await;
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::{error::Error, global_ctx::tests::get_mock_global_ctx};
 
     use super::VirtualNic;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_is_in_any_v4_subnet() {
+        let subnets = vec![
+            ("192.168.0.20".parse().unwrap(), "255.255.255.0".parse().unwrap()),
+            ("10.0.0.1".parse().unwrap(), "255.0.0.0".parse().unwrap()),
+        ];
+        assert!(super::is_in_any_v4_subnet(
+            "192.168.0.1".parse().unwrap(),
+            &subnets
+        ));
+        assert!(super::is_in_any_v4_subnet(
+            "10.200.1.1".parse().unwrap(),
+            &subnets
+        ));
+        assert!(!super::is_in_any_v4_subnet(
+            "192.168.2.1".parse().unwrap(),
+            &subnets
+        ));
+        assert!(!super::is_in_any_v4_subnet(
+            "220.203.172.102".parse().unwrap(),
+            &subnets
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_conn_remote_ipv4() {
+        use crate::proto::{
+            api::instance::PeerConnInfo,
+            common::{TunnelInfo, Url},
+        };
+
+        let mk = |remote: Option<&str>, resolved: Option<&str>| PeerConnInfo {
+            tunnel: Some(TunnelInfo {
+                tunnel_type: "udp".to_string(),
+                local_addr: None,
+                remote_addr: remote.map(|u| Url { url: u.to_string() }),
+                resolved_remote_addr: resolved.map(|u| Url { url: u.to_string() }),
+            }),
+            ..Default::default()
+        };
+
+        // resolved addr (the on-wire endpoint) wins over the configured one
+        assert_eq!(
+            super::conn_remote_ipv4(&mk(
+                Some("udp://example.com:11010"),
+                Some("udp://220.203.172.102:23456")
+            )),
+            Some("220.203.172.102".parse().unwrap())
+        );
+        assert_eq!(
+            super::conn_remote_ipv4(&mk(Some("tcp://8.219.8.190:11010"), None)),
+            Some("8.219.8.190".parse().unwrap())
+        );
+        // hostname-only url has no ipv4 to bypass
+        assert_eq!(
+            super::conn_remote_ipv4(&mk(Some("tcp://example.com:11010"), None)),
+            None
+        );
+        assert_eq!(super::conn_remote_ipv4(&PeerConnInfo::default()), None);
+    }
+
 
     async fn run_test_helper() -> Result<VirtualNic, Error> {
         let mut dev = VirtualNic::new(get_mock_global_ctx());

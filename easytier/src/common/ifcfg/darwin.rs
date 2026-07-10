@@ -134,3 +134,44 @@ impl IfConfiguerTrait for MacIfConfiger {
         .await
     }
 }
+
+impl MacIfConfiger {
+    /// Add a gateway-form route (UGSc). Unlike `-interface` routes, these do
+    /// not break IP_BOUND_IF-scoped sockets: the kernel can still route
+    /// interface-scoped traffic around them, which is essential for underlay
+    /// sockets while broad routes hijack the address space.
+    pub async fn add_ipv4_route_via_gateway(
+        &self,
+        address: Ipv4Addr,
+        cidr_prefix: u8,
+        gateway: Ipv4Addr,
+    ) -> Result<(), Error> {
+        run_shell_cmd(
+            format!(
+                "route -n add {} -netmask {} {}",
+                address,
+                cidr_to_subnet_mask(cidr_prefix),
+                gateway
+            )
+            .as_str(),
+        )
+        .await
+    }
+
+    /// Remove a route by destination and mask, regardless of its form.
+    pub async fn remove_ipv4_route_any(
+        &self,
+        address: Ipv4Addr,
+        cidr_prefix: u8,
+    ) -> Result<(), Error> {
+        run_shell_cmd(
+            format!(
+                "route -n delete {} -netmask {}",
+                address,
+                cidr_to_subnet_mask(cidr_prefix)
+            )
+            .as_str(),
+        )
+        .await
+    }
+}
