@@ -236,6 +236,7 @@ impl PunchSymToConeHoleClient {
         let udp_array = Arc::new(UdpSocketArray::new(
             UDP_ARRAY_SIZE_FOR_HARD_SYM,
             self.peer_mgr.get_global_ctx().net_ns.clone(),
+            self.peer_mgr.get_global_ctx().config.get_flags().bind_device,
         ));
         udp_array.start().await?;
         wlocked.replace(udp_array.clone());
