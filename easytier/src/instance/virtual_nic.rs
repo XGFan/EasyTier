@@ -23,6 +23,10 @@ use crate::{
     },
 };
 
+use crate::arch::route_hook::{
+    PlatformProxyRouteHook, ProxyRouteHook, ReconcileTicker, RouteHookResult,
+};
+
 use byteorder::WriteBytesExt as _;
 use bytes::{BufMut, BytesMut};
 use cidr::{Ipv4Inet, Ipv6Inet};
@@ -1045,6 +1049,7 @@ impl NicCtx {
         cur_proxy_cidrs: &mut BTreeSet<cidr::Ipv4Cidr>,
         added: Vec<cidr::Ipv4Cidr>,
         removed: Vec<cidr::Ipv4Cidr>,
+        hook: &mut impl ProxyRouteHook,
     ) {
         tracing::debug!(?added, ?removed, "applying proxy_cidrs route changes");
 
@@ -1053,6 +1058,12 @@ impl NicCtx {
             if !cur_proxy_cidrs.contains(&cidr) {
                 continue;
             }
+
+            if hook.try_remove_route(&cidr).await != RouteHookResult::NotHandled {
+                cur_proxy_cidrs.remove(&cidr);
+                continue;
+            }
+
             let _g = net_ns.guard();
             let ret = ifcfg
                 .remove_ipv4_route(ifname, cidr.first_address(), cidr.network_length())
@@ -1073,6 +1084,18 @@ impl NicCtx {
             if cur_proxy_cidrs.contains(&cidr) {
                 continue;
             }
+
+            match hook.try_add_route(&cidr).await {
+                RouteHookResult::NotHandled => {}
+                RouteHookResult::Done => {
+                    cur_proxy_cidrs.insert(cidr);
+                    continue;
+                }
+                // left unrecorded on purpose, so the hook's periodic reconcile
+                // retries it
+                RouteHookResult::Deferred => continue,
+            }
+
             let _g = net_ns.guard();
             let ret = ifcfg
                 .add_ipv4_route(ifname, cidr.first_address(), cidr.network_length(), None)
@@ -1141,6 +1164,10 @@ impl NicCtx {
         self.tasks.spawn(async move {
             let mut cur_proxy_cidrs = BTreeSet::<cidr::Ipv4Cidr>::new();
 
+            let mut hook =
+                PlatformProxyRouteHook::new(global_ctx.clone(), peer_mgr.clone(), ifname.clone());
+            let mut hook_reconcile = ReconcileTicker::new(hook.reconcile_interval());
+
             // Initial sync: get current proxy_cidrs state and apply routes
             let (_, added, removed) = ProxyCidrsMonitor::diff_proxy_cidrs(
                 peer_mgr.as_ref(),
@@ -1148,6 +1175,10 @@ impl NicCtx {
                 &cur_proxy_cidrs,
             )
             .await;
+
+            // let the hook prepare before the TUN routes start capturing traffic
+            hook.reconcile(&cur_proxy_cidrs, &added).await;
+
             Self::apply_route_changes(
                 &ifcfg,
                 &ifname,
@@ -1155,11 +1186,38 @@ impl NicCtx {
                 &mut cur_proxy_cidrs,
                 added,
                 removed,
+                &mut hook,
             )
             .await;
 
             loop {
-                let event = match event_receiver.recv().await {
+                let received = tokio::select! {
+                    r = event_receiver.recv() => r,
+                    _ = hook_reconcile.tick() => {
+                        let (_, added, removed) = ProxyCidrsMonitor::diff_proxy_cidrs(
+                            peer_mgr.as_ref(),
+                            &global_ctx,
+                            &cur_proxy_cidrs,
+                        )
+                        .await;
+                        hook.reconcile(&cur_proxy_cidrs, &added).await;
+                        if !added.is_empty() || !removed.is_empty() {
+                            Self::apply_route_changes(
+                                &ifcfg,
+                                &ifname,
+                                &net_ns,
+                                &mut cur_proxy_cidrs,
+                                added,
+                                removed,
+                                &mut hook,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                };
+
+                let event = match received {
                     Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::debug!("event bus closed, stopping proxy_cidrs route updater");
@@ -1181,11 +1239,16 @@ impl NicCtx {
                     }
                 };
 
-                // Only handle ProxyCidrsUpdated events
                 let (added, removed) = match event {
                     GlobalCtxEvent::ProxyCidrsUpdated(added, removed) => (added, removed),
+                    GlobalCtxEvent::PeerConnAdded(conn) => {
+                        hook.on_peer_conn_added(&cur_proxy_cidrs, &conn).await;
+                        continue;
+                    }
                     _ => continue,
                 };
+
+                hook.reconcile(&cur_proxy_cidrs, &added).await;
 
                 Self::apply_route_changes(
                     &ifcfg,
@@ -1194,9 +1257,12 @@ impl NicCtx {
                     &mut cur_proxy_cidrs,
                     added,
                     removed,
+                    &mut hook,
                 )
                 .await;
             }
+
+            hook.shutdown().await;
         });
 
         Ok(())
