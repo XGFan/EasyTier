@@ -43,3 +43,7 @@ easytier-gui/src-tauri/*.sys
 
 .direnv
 .flake-profile
+
+# fork-local verification config and notes (personal network details)
+fork/*.env
+fork/local/
