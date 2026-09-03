@@ -1,4 +1,6 @@
 mod default_route;
+#[cfg(test)]
+mod underlay_bind_tests;
 
 pub use default_route::*;
 
