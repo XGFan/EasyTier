@@ -82,6 +82,18 @@ impl CorePacketPlane {
         self.peer_manager.public_ipv6_addr().await
     }
 
+    /// Live peer connections, including those held through a public relay,
+    /// so platform route integrations can keep their underlay endpoints off
+    /// TUN routes.
+    pub async fn list_peer_conns(&self) -> Vec<easytier_proto::core_peer::peer::PeerConnInfo> {
+        self.peer_manager
+            .list_peer_snapshots()
+            .await
+            .into_iter()
+            .flat_map(|peer| peer.conns)
+            .collect()
+    }
+
     #[cfg(feature = "proxy-packet")]
     pub fn udp_broadcast_relay_stats(&self) -> UdpBroadcastRelayStats {
         let network_name = self

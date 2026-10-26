@@ -1418,13 +1418,36 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             log::info!("ctrl-c received, exiting...");
+            stop_instances_before_exit(&manager).await;
         }
 
         _ = sigterm, if cfg!(unix) => {
             log::warn!("terminate signal received, exiting...");
+            stop_instances_before_exit(&manager).await;
         }
     }
     Ok(())
+}
+
+/// macOS full tunnel leaves host routes via the physical gateway behind
+/// unless its instances shut down cleanly; elsewhere exiting is enough.
+async fn stop_instances_before_exit(
+    #[allow(unused_variables)] manager: &crate::instance::factory::NativeInstanceManager,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let stop_all = async {
+            for instance in manager.instances() {
+                instance.stop().await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), stop_all)
+            .await
+            .is_err()
+        {
+            log::warn!("instances did not stop within 5s, exiting anyway");
+        }
+    }
 }
 
 fn memory_monitor(_force_dump: Arc<AtomicBool>) {
