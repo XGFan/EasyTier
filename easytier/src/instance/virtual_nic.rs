@@ -7,6 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::arch::route_hook::{PlatformProxyRouteHook, ProxyRouteHook, ReconcileTicker};
 use crate::common::{
     error::Error,
     global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
@@ -36,6 +37,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 #[cfg(target_os = "windows")]
 use tokio_util::task::AbortOnDropHandle;
 use tun::{AbstractDevice, AsyncDevice, Configuration, Layer};
@@ -1065,9 +1067,20 @@ pub struct NicCtx {
 
     backend: NicBackend,
     tasks: JoinSet<()>,
+    // kept out of `tasks`: aborting it would skip the route hook's shutdown
+    proxy_route_updater: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
 
     #[cfg(target_os = "windows")]
     windows_udp_broadcast_relay: Option<AbortOnDropHandle<()>>,
+}
+
+impl Drop for NicCtx {
+    fn drop(&mut self) {
+        // dropped without `shutdown`: the updater still cleans up, just unawaited
+        if let Some((stop, _)) = self.proxy_route_updater.take() {
+            stop.cancel();
+        }
+    }
 }
 
 impl NicCtx {
@@ -1111,6 +1124,7 @@ impl NicCtx {
 
             backend,
             tasks: JoinSet::new(),
+            proxy_route_updater: None,
 
             #[cfg(target_os = "windows")]
             windows_udp_broadcast_relay: None,
@@ -1157,6 +1171,13 @@ impl NicCtx {
     }
 
     pub(crate) async fn shutdown(&mut self) {
+        // Stop the proxy-cidr route updater first and wait for its route hook
+        // to undo what it installed outside the TUN (e.g. the macOS bypass
+        // host routes), which the TUN going away does not take with it.
+        if let Some((stop, task)) = self.proxy_route_updater.take() {
+            stop.cancel();
+            let _ = task.await;
+        }
         // The forwarding tasks own the TUN stream and sink. Wait until both
         // release the device before another NIC with the same name is created.
         self.tasks.shutdown().await;
@@ -1395,18 +1416,58 @@ impl NicCtx {
             tracing::error!("proxy CIDR monitor host is unavailable");
             return Ok(());
         };
+
+        let mut hook = PlatformProxyRouteHook::new(global_ctx.clone(), packet_plane.clone());
+
+        // let the hook prepare before the TUN routes start capturing traffic
+        hook.reconcile(&cur_proxy_cidrs, &diff.added).await;
+
         if let Err(err) =
             Self::apply_route_changes(&backend, &mut cur_proxy_cidrs, diff.added, diff.removed)
                 .await
             && matches!(&backend, NicBackend::Shared(_))
         {
+            hook.shutdown().await;
             return Err(err);
         }
 
-        self.tasks.spawn(async move {
+        let stop = CancellationToken::new();
+        let stopped = stop.clone();
+
+        let task = tokio::spawn(async move {
+            let mut hook_reconcile = ReconcileTicker::new(hook.reconcile_interval());
+
             loop {
-                let should_sync = match event_receiver.recv().await {
+                let received = tokio::select! {
+                    _ = stopped.cancelled() => break,
+                    r = event_receiver.recv() => r,
+                    _ = hook_reconcile.tick() => {
+                        let Some(diff) = packet_plane.proxy_cidr_diff(&cur_proxy_cidrs).await
+                        else {
+                            continue;
+                        };
+                        hook.reconcile(&cur_proxy_cidrs, &diff.added).await;
+                        if (!diff.added.is_empty() || !diff.removed.is_empty())
+                            && let Err(err) = Self::apply_route_changes(
+                                &backend,
+                                &mut cur_proxy_cidrs,
+                                diff.added,
+                                diff.removed,
+                            )
+                            .await
+                        {
+                            tracing::error!(?err, "failed to update proxy CIDR routes");
+                        }
+                        continue;
+                    }
+                };
+
+                let should_sync = match received {
                     Ok(GlobalCtxEvent::ProxyCidrsUpdated(_, _)) => true,
+                    Ok(GlobalCtxEvent::PeerConnAdded(conn)) => {
+                        hook.on_peer_conn_added(&cur_proxy_cidrs, &conn).await;
+                        false
+                    }
                     Ok(_) => false,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::debug!("event bus closed, stopping proxy_cidrs route updater");
@@ -1427,8 +1488,10 @@ impl NicCtx {
                 // Full sync also retries routes that previously failed to apply.
                 let Some(diff) = packet_plane.proxy_cidr_diff(&cur_proxy_cidrs).await else {
                     tracing::error!("proxy CIDR monitor host is unavailable");
-                    return;
+                    break;
                 };
+
+                hook.reconcile(&cur_proxy_cidrs, &diff.added).await;
 
                 if let Err(err) = Self::apply_route_changes(
                     &backend,
@@ -1441,7 +1504,10 @@ impl NicCtx {
                     tracing::error!(?err, "failed to update proxy CIDR routes");
                 }
             }
+
+            hook.shutdown().await;
         });
+        self.proxy_route_updater = Some((stop, task));
 
         Ok(())
     }
