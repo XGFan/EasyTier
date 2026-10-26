@@ -50,3 +50,7 @@ easytier-gui/src-tauri/*.sys
 # contrib
 go.sum
 .test-env/
+
+# fork-local verification config and notes (personal network details)
+fork/*.env
+fork/local/
