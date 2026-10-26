@@ -494,14 +494,18 @@ async fn collect_local_ip_addrs_in_current_namespace() -> GetIpListResponse {
         }
     }
 
-    if let Ok(v4_addr) = local_ipv4().await {
+    if let Ok(v4_addr) = local_ipv4().await
+        && !is_tun_owned_ip(v4_addr.into())
+    {
         tracing::trace!("got local ipv4: {}", v4_addr);
         if !ret.interface_ipv4s.contains(&v4_addr.into()) {
             ret.interface_ipv4s.push(v4_addr.into());
         }
     }
 
-    if let Ok(v6_addr) = local_ipv6().await {
+    if let Ok(v6_addr) = local_ipv6().await
+        && !is_tun_owned_ip(v6_addr.into())
+    {
         tracing::trace!("got local ipv6: {}", v6_addr);
         if !ret.interface_ipv6s.contains(&v6_addr.into()) {
             ret.interface_ipv6s.push(v6_addr.into());
@@ -509,6 +513,16 @@ async fn collect_local_ip_addrs_in_current_namespace() -> GetIpListResponse {
     }
 
     ret
+}
+
+/// The interface list above already skips point-to-point devices, but the
+/// route-derived local address does not: while TUN routes are active it is a
+/// TUN's own IP, which connectors would then race a bind from.
+fn is_tun_owned_ip(#[allow(unused_variables)] ip: std::net::IpAddr) -> bool {
+    #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+    return crate::arch::macos::underlay::is_tun_owned_ip(ip);
+    #[cfg(not(all(target_os = "macos", not(feature = "macos-ne"))))]
+    false
 }
 
 #[cfg(test)]

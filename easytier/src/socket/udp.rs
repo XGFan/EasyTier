@@ -146,6 +146,11 @@ impl RuntimeUdpSocketFactory {
             return BindDev::from(bind_device.as_str());
         }
 
+        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+        if let Some(dev) = crate::arch::macos::underlay::underlay_udp_device(options) {
+            return BindDev::Custom(dev);
+        }
+
         if matches!(
             options.purpose,
             UdpSocketPurpose::DirectConnect
