@@ -246,7 +246,8 @@ impl RuntimeProvider for RuntimeDnsIoProvider {
     ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Udp>>>> {
         let options = UdpBindOptions::default()
             .with_context(self.context.socket_context())
-            .with_local_addr(Some(local_addr));
+            .with_local_addr(Some(local_addr))
+            .with_bind_device(Some(String::new()));
         Box::pin(async move { create_udp_socket(&options).await.map_err(io::Error::other) })
     }
 }

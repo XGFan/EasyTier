@@ -319,7 +319,15 @@ pub(crate) async fn connect_tcp(
 ) -> Result<RuntimeTcpSocket, TunnelError> {
     let remote_addr = options.remote_addr;
     let purpose = options.purpose;
-    let bind_options = options.bind;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut bind_options = options.bind;
+
+    #[cfg(target_os = "macos")]
+    if let Some(dev) =
+        crate::arch::macos::underlay::underlay_tcp_device(remote_addr, purpose, &bind_options)
+    {
+        bind_options.bind_device = Some(dev);
+    }
 
     let socket = create_tcp_socket(remote_addr, &bind_options).await?;
     let stream = socket.connect(remote_addr).await?;

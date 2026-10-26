@@ -161,7 +161,12 @@ impl GlobalCtx {
                 .map(|protocol| protocol.to_ascii_lowercase())
                 .collect()
         });
-        Self::new_inner(config_fs, Some(&runtime), protocols)
+        let ctx = Self::new_inner(config_fs, Some(&runtime), protocols);
+        // instances only: auxiliary contexts (e.g. the web client's) carry
+        // default flags and must not override an instance's choice
+        #[cfg(target_os = "macos")]
+        crate::arch::macos::underlay::set_underlay_scoping(ctx.get_flags().bind_device);
+        ctx
     }
 
     fn new_inner(
