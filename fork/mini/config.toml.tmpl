@@ -1,0 +1,28 @@
+# Rendered by fork/mini.sh deploy — do not edit on the test box.
+hostname      = "@HOSTNAME@"
+instance_name = "@HOSTNAME@"
+ipv4          = "@IPV4@"
+exit_nodes    = ["@EXIT_NODE@"]
+routes        = ["0.0.0.0/0"]
+
+[network_identity]
+network_name   = "@NETWORK_NAME@"
+network_secret = "@NETWORK_SECRET@"
+
+@PEERS@
+
+[flags]
+default_protocol = "tcp"
+mtu = 1380
+# the gate exercises the IPv4 hole-punch path; v6 would let peers connect
+# around it and the split default routes only cover v4 anyway
+enable_ipv6 = false
+bind_device = true
+
+[file_logger]
+level = "debug"
+file = "core"
+dir = "@DIR@/logs"
+
+[console_logger]
+level = "warn"
