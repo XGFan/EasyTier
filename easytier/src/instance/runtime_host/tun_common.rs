@@ -61,6 +61,13 @@ impl TunNicState {
         let mut old = self.nic_ctx.lock().await.take();
         if let Some(nic) = old.as_mut() {
             nic.magic_dns.stop().await;
+            if let Some(nic_ctx) = nic
+                ._nic_ctx
+                .as_mut()
+                .and_then(|ctx| ctx.downcast_mut::<NicCtx>())
+            {
+                nic_ctx.stop().await;
+            }
         }
         drop(old);
     }
